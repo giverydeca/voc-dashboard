@@ -1,0 +1,163 @@
+﻿param(
+  [int]$Limit = 10,
+  [string]$InputTsv = ".\data\form_2col_head10.tsv",
+  [string]$InstrPath = ".\instructions_min2.txt",
+  [string]$OutTsv = ".\outputs\form_structured_head10.tsv",
+  [string]$ErrTsv = ".\outputs\form_structured_head10_errors.tsv",
+  [string]$Model = "gpt-5.2",
+  [int]$MaxRetry = 3,
+  [int]$TimeoutSec = 60
+)
+
+
+# expected TSV header (22 cols)
+$ExpectedHeader = "顧客属性`t問い合わせ元サイト`t大区分NO`t大区分名`t小区分NO`t小区分名`tユーザーの意図(Intent)`t意図要約(短)`t対象機能(Target Function)`tWebサイトのバリア(Barrier)`tバリア要約(短)`tWeb自己解決可能性`t推定発生ページ`t発生タイミング`tWEBオーダー番号`t商品の注文番号`t商品名`t重要キーワード`t緊急度`t問い合わせ要約`t顧客の生の声`t商品カテゴリ小カテゴリ"
+$ExpectedCols = 22
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+function Sanitize-Lines([string]$s){
+  if ($null -eq $s) { return @() }
+  $lines = ($s -split "`n") | ForEach-Object { ($_ -replace "`r"," ").Trim() } | Where-Object { $_ -ne "" }
+  $lines = $lines | ForEach-Object { ($_ -replace "\s{2,}"," ").Trim() }
+  return ,$lines
+}
+
+function Ensure-Dir([string]$path){
+  $dir = Split-Path $path -Parent
+  if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+}
+
+function Write-Utf8BomLines([string]$path, [string[]]$lines){
+  $utf8bom = New-Object System.Text.UTF8Encoding($true)
+  [System.IO.File]::WriteAllLines($path, $lines, $utf8bom)
+}
+
+function Append-Utf8BomLine([string]$path, [string]$line){
+  $utf8bom = New-Object System.Text.UTF8Encoding($true)
+  [System.IO.File]::AppendAllText($path, $line + "`r`n", $utf8bom)
+}
+
+function Invoke-OpenAI_Text([string]$inputText, [string]$model, [int]$timeoutSec) {
+  Add-Type -AssemblyName System.Net.Http | Out-Null
+  $client = New-Object System.Net.Http.HttpClient
+  $client.Timeout = [TimeSpan]::FromSeconds($timeoutSec)
+
+  $req = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Post, "https://api.openai.com/v1/responses")
+  $req.Headers.Authorization = New-Object System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", $env:OPENAI_API_KEY)
+  $req.Headers.UserAgent.ParseAdd("csv-alchemist/1.0")
+
+  $bodyObj = @{
+    model = $model
+    input = $inputText
+    temperature = 0
+  }
+
+  $json = ($bodyObj | ConvertTo-Json -Depth 10)
+  $req.Content = New-Object System.Net.Http.StringContent($json, [Text.Encoding]::UTF8, "application/json")
+
+  $res = $client.SendAsync($req).GetAwaiter().GetResult()
+  $content = $res.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+
+  if (-not $res.IsSuccessStatusCode) {
+    $snippet = $content
+    if ($snippet -and $snippet.Length -gt 800) { $snippet = $snippet.Substring(0,800) }
+    throw ("HTTP {0} {1} body_len={2} body={3}" -f [int]$res.StatusCode, $res.ReasonPhrase, ($content.Length), ($snippet -replace "`r|`n"," "))
+  }
+
+  $obj = $content | ConvertFrom-Json
+
+  if ($obj.PSObject.Properties.Name -contains "output_text") {
+    if ($obj.output_text) { return [string]$obj.output_text }
+  }
+
+  $texts = @()
+  if ($obj.output) {
+    foreach($item in @($obj.output)){
+      if ($item.type -eq "message" -and $item.content){
+        foreach($c in @($item.content)){
+          if ((($c.type -eq "output_text") -or ($c.type -eq "text")) -and $c.text) { $texts += [string]$c.text }
+        }
+      }
+    }
+  }
+  return ($texts -join "`n")
+}
+
+# ---- start ----
+if (-not $env:OPENAI_API_KEY) { throw "OPENAI_API_KEY is not set in this session." }
+if (-not (Test-Path $InputTsv)) { throw "Input not found: $InputTsv" }
+if (-not (Test-Path $InstrPath)) { throw "Instructions not found: $InstrPath" }
+
+Ensure-Dir $OutTsv
+Ensure-Dir $ErrTsv
+$headerCsv = "顧客属性,問い合わせ元サイト,大区分NO,大区分名,小区分NO,小区分名,ユーザーの意図(Intent),意図要約(短),対象機能(Target Function),Webサイトのバリア(Barrier),バリア要約(短),Web自己解決可能性,推定発生ページ,発生タイミング,WEBオーダー番号,商品の注文番号,商品名,重要キーワード,緊急度,問い合わせ要約,顧客の生の声,商品カテゴリ小カテゴリ"
+$headerTsv = $headerCsv -replace ",","`t"
+
+if (-not (Test-Path $OutTsv)) { Write-Utf8BomLines $OutTsv @($headerTsv) }
+if (-not (Test-Path $ErrTsv)) { Write-Utf8BomLines $ErrTsv @("rowIndex`terror") }
+
+$instr = Get-Content $InstrPath -Raw
+$rows = Import-Csv -Path $InputTsv -Delimiter "`t"
+$rows = @($rows)
+
+$N = [Math]::Min($rows.Count, $Limit)
+Write-Host ("START model={0} rows={1} limit={2}" -f $Model, $rows.Count, $N)
+
+for ($i=0; $i -lt $N; $i++){
+  $date = $rows[$i]."お問い合わせ日"
+  $bodyText = $rows[$i]."内容"
+  if (-not $date) { $date = "不明" }
+  if (-not $bodyText) { $bodyText = "不明" }
+
+  $oneInput = "$date`t$bodyText"
+
+  $prompt = @"
+$instr
+
+#DATA
+入力TSV（2列、タブ区切り、1行=1件）:
+$oneInput
+"@
+
+  $ok = $false
+  $lastErr = ""
+
+  for ($try=1; $try -le $MaxRetry; $try++){
+    try{
+      $raw = Invoke-OpenAI_Text -inputText $prompt -model $Model -timeoutSec $TimeoutSec
+      $lines = Sanitize-Lines $raw
+      $lines = @($lines)
+
+      # 22列TSV行だけ拾う（説明文などは捨てる）
+      $lines = $lines | Where-Object { (($_ -split "`t",-1).Count) -eq 22 }
+
+
+      # DEBUG: raw先頭をerrorsへ（TSVが拾えない原因調査）
+      $rawHead = (($raw | Out-String) -replace "`r|`n"," ")
+      if ($rawHead.Length -gt 800) { $rawHead = $rawHead.Substring(0,800) }
+      Append-Utf8BomLine $ErrTsv ("{0}`tRAW_HEAD: {1}" -f $i, $rawHead)
+      if (@($lines).Length -lt 1) { throw "No valid 22-col TSV lines in output" }
+      if (@($lines).Length -gt 3) { $lines = $lines | Select-Object -First 3 }
+
+      foreach($ln in $lines){ Append-Utf8BomLine $OutTsv $ln }
+      $ok = $true
+      break
+    } catch {
+      $lastErr = $_.Exception.Message
+      Start-Sleep -Seconds (2 * $try)
+    }
+  }
+
+  if (-not $ok){
+    Append-Utf8BomLine $ErrTsv ("{0}`t{1}" -f $i, ($lastErr -replace "`r|`n"," "))
+  }
+
+  Write-Host ("[progress] {0}/{1}" -f ($i+1), $N)
+}
+
+Write-Host "DONE"
+Write-Host ("OUT: {0}" -f $OutTsv)
+Write-Host ("ERR: {0}" -f $ErrTsv)
+
